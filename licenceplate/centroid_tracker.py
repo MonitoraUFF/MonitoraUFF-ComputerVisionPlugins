@@ -32,10 +32,10 @@ class CentroidTracker():
 		del self.objects[objectID]
 		del self.disappeared[objectID]
 
-	def update(self, rects):
+	def update(self, centroids):
 		# verifique se a lista de retângulos da caixa delimitadora de entrada
 		# está vazia
-		if len(rects) == 0:
+		if len(centroids) == 0:
 			# faz um loop sobre quaisquer objetos rastreados existentes e os marca
 			# desapareceu
 			for objectID in list(self.disappeared.keys()):
@@ -49,11 +49,11 @@ class CentroidTracker():
 			# atualizar
 			return self.objects
         # inicializa uma matriz de centróides de entrada para o quadro atual
-		inputCentroids = np.zeros((len(rects), 2), dtype="int")
+		inputCentroids = np.zeros((len(centroids), 2), dtype="int")
 		# loop sobre os retângulos da caixa delimitadora
-		for (i, (cX, cY)) in enumerate(rects):
+		for (i, (center_x, center_y)) in enumerate(centroids):
 			# use as coordenadas da caixa delimitadora para derivar o centróide
-			inputCentroids[i] = (cX, cY)
+			inputCentroids[i] = (center_x, center_y)
         # se não estivermos rastreando nenhum objeto, pegue a entrada
 		# centroids e registre cada um deles
 		if len(self.objects) == 0:
