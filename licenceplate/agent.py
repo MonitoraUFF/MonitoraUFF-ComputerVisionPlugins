@@ -3,7 +3,7 @@ matplotlib.use('Agg', force=True)
 
 from datetime import datetime
 from difflib import SequenceMatcher
-from enum import Enum, IntFlag, unique
+from enum import auto, Enum, IntFlag, StrEnum, unique
 from easyocr import Reader
 from functools import partial
 from glob import glob
@@ -34,6 +34,7 @@ class DetectedVehicle(TypedDict):
 class DetectedPlate(TypedDict):
     plate: str
     warped_plate: NDArray[np.uint8]
+    warped_plate_ocr: NDArray[np.uint8]
     vehicle: NDArray[np.uint8]
     vehicle_roi: Tuple[int, int, int, int]
     plate_roi: Tuple[int, int, int, int]
@@ -41,11 +42,18 @@ class DetectedPlate(TypedDict):
 
 
 class ReportedPlate(TypedDict):
+    id: str
     plate: str
     vehicle: NDArray[np.uint8]
     warped_plate: NDArray[np.uint8]
+    warped_plate_ocr: NDArray[np.uint8]
     when: datetime
 
+
+@unique
+class StorageTask(StrEnum):
+    CREATE = auto()
+    UPDATE = auto()
 
 class StoredPlate(TypedDict):
     plate: str
@@ -53,21 +61,23 @@ class StoredPlate(TypedDict):
 
 
 class TrackedVehicle(TypedDict):
+    id: str
     centroid: NDArray[np.float32]
     history: List[DetectedPlate]
 
 
 @unique
 class AgentEvent(Enum):
-    DETECTION = 0
-    STREAM_OPEN = 1
-    STREAM_CLOSE = 2
+    DETECTION_CREATE = auto()
+    DETECTION_UPDATE = auto()
+    STREAM_OPEN = auto()
+    STREAM_CLOSE = auto()
 
 
 class AgentStatus(IntFlag):
-    STOPPED = 0
-    RUNNING = 1
-    PROCESSING = 2
+    STOPPED = 0      # 00b -> The empty set
+    RUNNING = 1      # 01b
+    PROCESSING = 2   # 10b
 
 
 class Agent:
@@ -100,6 +110,7 @@ class Agent:
         self._logger.info(f'{self.tag_slug}\tdel')
 
     def _find_plate_candidates(self, lpd_model: YOLO, ocr_model: Reader, detected_vehicle: DetectedVehicle) -> List[DetectedPlate]:
+        #TODO Fazer OCR em batch
         result: List[DetectedPlate] = list()
         # The vehicle's image may include several plate box candidates
         vehicle_bgr = detected_vehicle['vehicle']
@@ -109,12 +120,12 @@ class Agent:
             plate_bgr = vehicle_bgr[y1:y2, x1:x2]
             plate_gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
             plate_bin = cv2.adaptiveThreshold(plate_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-            contours, _ = cv2.findContours(plate_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+            plate_contours, _ = cv2.findContours(plate_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            plate_contours = sorted(plate_contours, key=cv2.contourArea, reverse=True)[:5]
             # Each contour is a candidate projected plate
-            for contour in contours:
+            for plate_contour in plate_contours:
                 # But the contours may be defined by por than four vertices, so we have to simplify it
-                chull = cv2.convexHull(contour, clockwise=False, returnPoints=True)
+                chull = cv2.convexHull(plate_contour, clockwise=False, returnPoints=True)
                 while len(chull) > 4:
                     vertices = np.concatenate((np.concatenate((chull[-1][None, ...], chull, chull[0][None, ...]), axis=0).squeeze(), np.ones((len(chull) + 2, 1), dtype=chull.dtype)), axis=1)
                     matrices = np.stack((vertices[:-2], vertices[1:-1], vertices[2:]), axis=1, dtype=np.float32)
@@ -123,6 +134,8 @@ class Agent:
                 # Given a convex quadrilateral...
                 if len(chull) == 4:
                     # ... warp it to a rectangle...
+                    target_height, target_width = 65, 200
+                    target_area = target_width * target_height
                     x = chull.squeeze()
                     mu = x.mean(axis=0)
                     sigma = np.cov(x.T)
@@ -132,56 +145,82 @@ class Agent:
                     d = np.matmul(x - mu, u)
                     angle = np.arctan2(d[:, 1], d[:, 0])
                     source_pts = np.float32(x[np.argsort(angle)])
-                    target_pts = np.float32([[0, 0], [200, 0], [200, 65], [0, 65]])
+                    target_pts = np.float32([[0, 0], [target_width, 0], [target_width, target_height], [0, target_height]])
                     affine_mtx = cv2.estimateAffine2D(source_pts, target_pts)[0]
-                    warped_plate_bgr = cv2.warpAffine(plate_bgr, affine_mtx, (200, 65))
-                    warped_plate_gray = cv2.warpAffine(plate_gray, affine_mtx, (200, 65))
-                    # ... find each character...
-                    #TODO Substituindo o OCR feito sobre a imagem crua, pois ele não funciona
+                    warped_plate_bgr = cv2.warpAffine(plate_bgr, affine_mtx, (target_width, target_height))
+                    warped_plate_gray = cv2.warpAffine(plate_gray, affine_mtx, (target_width, target_height))
+                    # ... filter warped image...
+                    warped_plate_blur = cv2.bilateralFilter(warped_plate_gray, 9, 75, 75)
+                    warped_plate_bin = cv2.adaptiveThreshold(warped_plate_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+                    char_contours, _ = cv2.findContours(warped_plate_bin, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+                    valid_char_contours = list()
+                    for char_contour in char_contours:
+                        u1, v1 = char_contour.min(axis=(0, 1))
+                        u2, v2 = char_contour.max(axis=(0, 1))
+                        char_box_height, char_box_width = v2 - v1, u2 - u1
+                        char_box_area = char_box_width * char_box_height
+                        if char_box_width < char_box_height and 0.02 <= (char_box_area / target_area) <= 0.15:
+                            valid_char_contours.append(char_contour)
+                    warped_plate_chars_bin = np.full((target_height, target_width), 255, dtype=np.uint8)
+                    cv2.drawContours(warped_plate_chars_bin, valid_char_contours, -1, 0, cv2.FILLED, cv2.LINE_4)
+                    warped_plate_chars_bin = cv2.bitwise_or(warped_plate_chars_bin, warped_plate_bin)
                     # ... and perform OCR
-                    plate = ''.join(ocr_model.readtext(warped_plate_gray, detail=0, allowlist=self.CHAR_WHITELIST))
-                    if len(plate) > 0:
+                    plate_ = ''.join(ocr_model.readtext(warped_plate_bin, detail=0, allowlist=self.CHAR_WHITELIST))
+                    plate = ''.join(ocr_model.readtext(warped_plate_chars_bin, detail=0, allowlist=self.CHAR_WHITELIST))
+                    if len(plate) >= 7:
                         result.append(DetectedPlate(
                             plate=plate,
                             warped_plate=warped_plate_bgr,
+                            warped_plate_ocr=warped_plate_chars_bin,
                             vehicle=vehicle_bgr,
                             vehicle_roi=detected_vehicle['vehicle_roi'],
                             plate_roi=(x1, y1, x2, y2),
                             when=detected_vehicle['when'],
                         ))
+                    elif len(plate_) >= 7:
+                        pass
         return result
     
-    def _make_reported_plate(self, history: List[DetectedPlate]) -> ReportedPlate:
-        # Check the frequency of each character in each entry of the plate 
-        num_entries = max(map(lambda arg: len(arg['plate']), history))
-        count = np.zeros((num_entries, len(self.CHAR_WHITELIST)), dtype=np.uint32)
-        for detected_plate in history:
-            for entry_idx, entry in enumerate(detected_plate['plate']):
-                count[entry_idx, self.CHAR_WHITELIST.index(entry)] += 1
-        # Keep the most voted characters
-        winner_idx = count.argmax(axis=1)
-        plate = ''.join(map(lambda idx: self.CHAR_WHITELIST[idx], winner_idx))
-        # Find the most likely image
-        sequence_matcher = SequenceMatcher(a=plate)
-        best_ratio = -float("inf")
-        best_detected_plate = None
-        for detected_plate in history:
-            sequence_matcher.set_seq2(detected_plate['plate'])
-            ratio = sequence_matcher.ratio()
-            if best_ratio < ratio:
-                best_ratio = ratio
-                best_detected_plate = detected_plate
+    def _make_reported_plate(self, tracked_vehicle: TrackedVehicle) -> ReportedPlate:
+        history = tracked_vehicle['history']
+        if len(history) == 1:
+            best_detected_plate = history[0]
+            plate = best_detected_plate['plate']
+        else:
+            # Check the frequency of each character in each entry of the plate
+            num_entries = max(map(lambda arg: len(arg['plate']), history))
+            count = np.zeros((num_entries, len(self.CHAR_WHITELIST)), dtype=np.uint32)
+            for detected_plate in history:
+                for entry_idx, entry in enumerate(detected_plate['plate']):
+                    count[entry_idx, self.CHAR_WHITELIST.index(entry)] += 1
+            # Keep the most voted characters
+            winner_idx = count.argmax(axis=1)
+            plate = ''.join(map(lambda idx: self.CHAR_WHITELIST[idx], winner_idx))
+            # Find the most likely image
+            sequence_matcher = SequenceMatcher(a=plate)
+            best_ratio = -float("inf")
+            best_detected_plate = None
+            for detected_plate in history:
+                sequence_matcher.set_seq2(detected_plate['plate'])
+                ratio = sequence_matcher.ratio()
+                if best_ratio < ratio:
+                    best_ratio = ratio
+                    best_detected_plate = detected_plate
         # Return the plate to be reported
         return ReportedPlate(
+            id=tracked_vehicle['id'],
             plate=plate,
             vehicle=best_detected_plate['vehicle'],
             warped_plate=best_detected_plate['warped_plate'],
+            warped_plate_ocr=best_detected_plate['warped_plate_ocr'],
             when=best_detected_plate['when'],
         )
     
-    def _perform_tracking(self, detected_plates: List[DetectedPlate], patience_in_seconds: float) -> List[ReportedPlate]:
-        result: List[ReportedPlate] = list()
+    def _perform_tracking(self, detected_plates: List[DetectedPlate], patience_in_seconds: float) -> Tuple[List[ReportedPlate], List[ReportedPlate]]:
+        create: List[ReportedPlate] = list()
+        update: List[ReportedPlate] = list()
         with self._tracking_lock:
+            count_register = count_update = count_unregister = 0
             # If there are vehicles being tracked then they must be updated or deregistred
             num_tracked_vehicles = len(self._tracked_vehicles)
             if num_tracked_vehicles != 0:
@@ -222,6 +261,7 @@ class Agent:
                         tracked_vehicle['history'].append(detected_plates[col])
                         used_rows[row] = True
                         used_cols[col] = True
+                        count_update += 1
                     # Iterate over the unused rows and deregister vehicles that have been
                     # missing for a long time
                     for row in range(num_tracked_vehicles-1, -1, -1):
@@ -229,35 +269,46 @@ class Agent:
                             tracked_vehicle = self._tracked_vehicles[row]
                             elapsed_time = datetime.now() - tracked_vehicle['history'][-1]['when']
                             if elapsed_time.total_seconds() > patience_in_seconds:
-                                result.append(self._make_reported_plate(tracked_vehicle['history']))
+                                update.append(self._make_reported_plate(tracked_vehicle))
                                 del self._tracked_vehicles[row]
+                                count_unregister += 1
                     # Iterate over the unused columns and register new vehicles
                     for col in range(num_detected_plates):
                         if not used_cols[col]:
-                            self._tracked_vehicles.append(TrackedVehicle(
+                            tracked_vehicle = TrackedVehicle(
+                                id=str(uuid.uuid4()),
                                 centroid=new_centroids[col],
                                 history=[detected_plates[col]],
-                            ))
+                            )
+                            create.append(self._make_reported_plate(tracked_vehicle))
+                            self._tracked_vehicles.append(tracked_vehicle)
+                            count_register += 1
                 # Otherwise, existing vehicles may only be deregristred if they have been missing for a long time
                 else:
                     for idx in range(num_tracked_vehicles-1, -1, -1):
                         tracked_vehicle = self._tracked_vehicles[idx]
                         elapsed_time = datetime.now() - tracked_vehicle['history'][-1]['when']
                         if elapsed_time.total_seconds() > patience_in_seconds:
-                            result.append(self._make_reported_plate(tracked_vehicle['history']))
+                            update.append(self._make_reported_plate(tracked_vehicle))
                             del self._tracked_vehicles[idx]
+                            count_unregister += 1
             # Otherwise, the detected plates are new vehicles to be tracked 
             else:
                 for detected_plate in detected_plates:
                     offset_x, offset_y, _, _ = detected_plate['vehicle_roi']
                     x1, y1, x2, y2 = detected_plate['plate_roi']
                     centroid = np.asarray((offset_x + (x1 + x2) / 2, offset_y + (y1 + y2) / 2), dtype=np.float32)
-                    self._tracked_vehicles.append(TrackedVehicle(
+                    tracked_vehicle = TrackedVehicle(
+                        id=str(uuid.uuid4()),
                         centroid=centroid,
                         history=[detected_plate],
-                    ))
-        # Report the missing vehicles
-        return result
+                    )
+                    create.append(self._make_reported_plate(tracked_vehicle))
+                    self._tracked_vehicles.append(tracked_vehicle)
+                    count_register += 1
+            print(f'====> register = {count_register}, update = {count_update}, unregister = {count_unregister}, ok = {(count_register + count_update) == len(detected_plates)}')
+        # Report the new and the missing vehicles
+        return create, update
 
     def _run_final_storage_worker(self, server_address: str) -> None:
         self._logger.debug(f'{self.tag_slug}\tfinal storage worker - begin')
@@ -276,9 +327,23 @@ class Agent:
                             json_filename = os.path.basename(files[0])
                             with open(os.path.join(self._local_storage_dir, json_filename), 'r') as fp:
                                 data = json.load(fp)
-                            self._send(server_address, AgentEvent.DETECTION, data)
-                            os.rename(os.path.join(self._local_storage_dir, data['filename']), os.path.join(self._final_storage_dir, data['filename']))
-                            os.remove(os.path.join(self._local_storage_dir, json_filename))
+                            storage_task = StorageTask(data['task'])
+                            filename = data['filename']
+                            if storage_task == StorageTask.CREATE:
+                                if not os.path.exists(os.path.join(self._final_storage_dir, filename)):
+                                    self._send(server_address, AgentEvent.DETECTION_CREATE, data)
+                                    os.rename(os.path.join(self._local_storage_dir, filename), os.path.join(self._final_storage_dir, filename))
+                                else:
+                                    os.remove(os.path.join(self._local_storage_dir, filename))
+                                os.remove(os.path.join(self._local_storage_dir, json_filename))
+                            elif storage_task == StorageTask.UPDATE:
+                                self._send(server_address, AgentEvent.DETECTION_UPDATE, data)
+                                if os.path.exists(os.path.join(self._final_storage_dir, filename)):
+                                    os.remove(os.path.join(self._final_storage_dir, filename))
+                                os.rename(os.path.join(self._local_storage_dir, filename), os.path.join(self._final_storage_dir, filename))
+                                os.remove(os.path.join(self._local_storage_dir, json_filename))
+                            else:
+                                raise NotImplementedError
                 except Exception as error:
                     self._logger.error(f'{self.tag_slug}\tfinal storage worker - exception handler, loop still running: "{str(error)}"')
                     time.sleep(10)
@@ -287,46 +352,52 @@ class Agent:
             raise            
         self._logger.debug(f'{self.tag_slug}\tfinal storage worker - end')
 
-    def _run_local_storage_worker(self, worker_idx: int, storage_queue: "Queue[ReportedPlate]") -> None:
+    def _run_local_storage_worker(self, worker_idx: int, storage_queue: "Queue[Tuple[StorageTask, ReportedPlate]]") -> None:
         PASSWORD_CHARS = string.ascii_letters + string.digits
         PASSWORD_SIZE = 8
         self._logger.debug(f'{self.tag_slug}\tlocal storage worker #{worker_idx} - begin')
         try:
             # While we have data to store...
-            reported_plate = storage_queue.get()
-            while reported_plate is not None:
+            data = storage_queue.get()
+            while data is not None:
+                storage_task, reported_plate = data
                 try:
                     # Encode the plate as a PNG file
                     success, vehicle_png = cv2.imencode('.png', reported_plate['vehicle'])
                     if not success: raise Exception('Error converting to PNG')
                     success, warped_plate_png = cv2.imencode('.png', reported_plate['warped_plate'])
                     if not success: raise Exception('Error converting to PNG')
-                    # Put all information in a ZIP file
-                    filename = f'{str(uuid.uuid4())}.zip'
-                    password = ''.join(random.choice(PASSWORD_CHARS) for _ in range(PASSWORD_SIZE))
-                    info = StoredPlate(
-                        plate=reported_plate['plate'],
-                        when=reported_plate['when'].isoformat(sep=' '),
-                    )
-                    with zipfile.ZipFile(os.path.join(self._local_storage_dir, filename), mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-                        zf.writestr('info.json', json.dumps(info))
-                        zf.writestr('vehicle.png', vehicle_png.tostring())
-                        zf.writestr('warped_plate.png', warped_plate_png.tostring())
-                    with open(os.path.join(self._local_storage_dir, filename), mode='rb') as fp:
-                        md5sum = hashlib.md5()
-                        for buf in iter(partial(fp.read, 128), b''):
-                            md5sum.update(buf)
-                    # Write a header to a JSON file
+                    success, warped_plate_ocr_png = cv2.imencode('.png', reported_plate['warped_plate_ocr'])
+                    if not success: raise Exception('Error converting to PNG')
                     with self._local_storage_lock:
-                        with open(os.path.join(self._local_storage_dir, f'{filename}.json'), 'w') as fp:
-                            json.dump({
-                                'who': self.tag_slug,
-                                'when': info['when'],
-                                'plate': info['plate'],
-                                'filename': filename,
-                                'password': password,
-                                'md5sum': md5sum.hexdigest(),
-                            }, fp)
+                        # Put all information in a ZIP file
+                        filename = f'{reported_plate["id"]}.zip'
+                        password = ''.join(random.choice(PASSWORD_CHARS) for _ in range(PASSWORD_SIZE))
+                        info = StoredPlate(
+                            plate=reported_plate['plate'],
+                            when=reported_plate['when'].isoformat(sep=' '),
+                        )
+                        with zipfile.ZipFile(os.path.join(self._local_storage_dir, filename), mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                            zf.writestr('info.json', json.dumps(info))
+                            zf.writestr('vehicle.png', vehicle_png.tostring())
+                            zf.writestr('warped_plate.png', warped_plate_png.tostring())
+                            zf.writestr('warped_plate_ocr.png', warped_plate_ocr_png.tostring())
+                        with open(os.path.join(self._local_storage_dir, filename), mode='rb') as fp:
+                            md5sum = hashlib.md5()
+                            for buf in iter(partial(fp.read, 128), b''):
+                                md5sum.update(buf)
+                        # Write a header to a JSON file
+                        if storage_task == StorageTask.UPDATE or (storage_task == StorageTask.CREATE and not os.path.exists(os.path.join(self._local_storage_dir, f'{filename}.json'))):
+                            with open(os.path.join(self._local_storage_dir, f'{filename}.json'), 'w') as fp:
+                                json.dump({
+                                    'task': storage_task,
+                                    'who': self.tag_slug,
+                                    'when': info['when'],
+                                    'plate': info['plate'],
+                                    'filename': filename,
+                                    'password': password,
+                                    'md5sum': md5sum.hexdigest(),
+                                }, fp)
                 except Exception as error:
                     self._logger.error(f'{self.tag_slug}\tlocal storage worker #{worker_idx} - exception handler, loop still running: "{str(error)}"')
                 finally:
@@ -346,7 +417,7 @@ class Agent:
         try:
             # Create the queues that keep the data to be processed and stored locally
             vehicle_queue: "Queue[DetectedVehicle]" = Queue(maxsize=vehicle_queue_size)
-            storage_queue: "Queue[ReportedPlate]" = Queue(maxsize=storage_queue_size)
+            storage_queue: "Queue[Tuple[StorageTask, ReportedPlate]]" = Queue(maxsize=storage_queue_size)
             # Create a set of YOLO models pre-trained on a LPR dataset (https://universe.roboflow.com/roboflow-universe-projects/license-plate-recognition-rxg4e/dataset/4) and a set of EasyOCR models
             lpd_models = [YOLO(os.path.join(config_dir, 'yolov8lpd.pt')).to(device) for _ in range(num_vehicle_workers)]
             ocr_models = [Reader(['en'], gpu=torch.cuda.is_available()) for _ in range(num_vehicle_workers)]
@@ -396,8 +467,11 @@ class Agent:
                             vehicle_queue.join()
                             elapsed_processing = time.perf_counter() - begin
                             begin = time.perf_counter()
-                            for reported_plate in self._perform_tracking(detected_plates, patience_in_seconds):
-                                storage_queue.put(reported_plate)
+                            create, update = self._perform_tracking(detected_plates, patience_in_seconds)
+                            for reported_plate in create:
+                                storage_queue.put((StorageTask.CREATE, reported_plate))
+                            for reported_plate in update:
+                                storage_queue.put((StorageTask.UPDATE, reported_plate))
                             elapsed_tracking = time.perf_counter() - begin
                             print(f'Initialization: {elapsed_initializetion:1.4f}, Processing: {elapsed_processing:1.4f}, Tracking: {elapsed_tracking:1.4f}, Total: {elapsed_initializetion + elapsed_processing + elapsed_tracking:1.4f}')
                         self._logger.info(f'{self.tag_slug}\tstream closed')
