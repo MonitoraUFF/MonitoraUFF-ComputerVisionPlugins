@@ -91,5 +91,5 @@ RUN git clone https://github.com/MonitoraUFF/MonitoraUFF-ComputerVisionPlugins.g
 VOLUME /app
 
 WORKDIR /app
-# ENTRYPOINT ["python3", "-m"]
-ENTRYPOINT ["bash"]
+ENTRYPOINT ["python3", "-m"]
+# ENTRYPOINT ["bash"]
