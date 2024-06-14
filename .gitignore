@@ -162,3 +162,7 @@ cython_debug/
 #.idea/
 
 plugins-storage/
+
+data/
+
+.vscode/
