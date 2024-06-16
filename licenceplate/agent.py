@@ -12,6 +12,7 @@ from functools import partial
 from glob import glob
 from numpy.typing import NDArray
 from queue import Queue
+from torch import Tensor
 from tqdm import tqdm
 from typing import Any, Dict, Final, List, Optional, Sequence, Tuple, TypedDict
 from ultralytics import YOLO
@@ -32,7 +33,7 @@ TARGET_AREA: Final = TARGET_WIDTH * TARGET_HEIGHT
 TARGET_CORNERS: Final = np.asarray([[0, 0], [TARGET_WIDTH, 0], [TARGET_WIDTH, TARGET_HEIGHT], [0, TARGET_HEIGHT]], dtype=np.float32)
 
 
-USED_COCO_CLASS_NAMES: List[str] = ['car', 'bus', 'truck']  #TODO Implementar heurística para placa de 'motorcycle'
+USED_COCO_CLASS_NAMES: List[str] = ['car', 'bus', 'truck']
 
 
 _hex_to_bgr = lambda hex: (int(hex[4:6], base=16), int(hex[2:4], base=16), int(hex[0:2], base=16))
@@ -72,10 +73,6 @@ class DetectedPlate(TypedDict):
     warped_plate: NDArray[np.uint8]
     frame: NDArray[np.uint8]
     when: datetime
-
-
-class PlateCandidate(TypedDict):
-    pass
 
 
 class ReportedPlate(TypedDict):
@@ -284,8 +281,7 @@ class Agent:
         # Return the list of current vehicles and vehicles that are missing for a long time
         return online, deleted
     
-    def _read_plate(self, frame_bgr: NDArray[np.uint8], plate_roi: ROI, ocr_model: Reader) -> List[PlateCandidate]:
-        result: List[PlateCandidate] = list()
+    def _warp_plate(self, frame_bgr: NDArray[np.uint8], plate_roi: ROI, overlap_idxs: Tensor, plate_roi_batch: List[ROI], overlap_idxs_batch: List[Tensor], warped_plate_bgr_batch: List[NDArray[np.uint8]], warped_chars_bin_batch: List[NDArray[np.uint8]]) -> None:
         # The plate ROI includes a perspective projection of the plate, so we have to find the quadrilateral resulting from this projection
         plate_bgr = frame_bgr[plate_roi[1]:plate_roi[3], plate_roi[0]:plate_roi[2]]
         plate_gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
@@ -293,8 +289,6 @@ class Agent:
         plate_contours, _ = cv2.findContours(plate_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         plate_contours = sorted(plate_contours, key=cv2.contourArea, reverse=True)[:5]
         # Each contour is a candidate projected plate
-        warped_plate_bgr_list: List[NDArray] = list()
-        warped_chars_bin_list: List[NDArray] = list()
         for plate_contour in plate_contours:
             # But the contours may be defined by more than four vertices, so we have to simplify it
             chull = cv2.convexHull(plate_contour, clockwise=False, returnPoints=True)
@@ -311,19 +305,11 @@ class Agent:
                 warped_plate_bin = self._convert_from_gray_to_binary(warped_plate_gray)
                 # ... compute an binary image having only the characters of the plate, ...
                 warped_chars_bin = self._compute_binary_image_of_chars(warped_plate_bin)
-                # ... and keep images
-                warped_plate_bgr_list.append(warped_plate_bgr)
-                warped_chars_bin_list.append(warped_chars_bin)
-        # Perform OCR
-        #TODO Fazer batches maiores
-        for warped_plate_bgr, ocr in zip(warped_plate_bgr_list, ocr_model.readtext_batched(warped_chars_bin_list, batch_size=len(warped_chars_bin_list), detail=0, allowlist=CHAR_WHITELIST)):
-            plate = ''.join(ocr)
-            if len(plate) >= 5:
-                result.append(PlateCandidate(
-                    plate=plate,
-                    warped_plate=warped_plate_bgr,
-                ))
-        return result
+                # ... and keep resulting data
+                plate_roi_batch.append(plate_roi)
+                overlap_idxs_batch.append(overlap_idxs)
+                warped_plate_bgr_batch.append(warped_plate_bgr)
+                warped_chars_bin_batch.append(warped_chars_bin)
 
     def _run_final_storage_worker(self, server_address: str) -> None:
         self._logger.debug(f'{self.tag_slug}\tfinal storage worker - begin')
@@ -481,9 +467,13 @@ class Agent:
                                 detected_plates: List[DetectedPlate] = list()
                                 if len(online) != 0:
                                     plate_boxes = lpd_model(frame_bgr, imgsz=lpd_model_imgsz, device=lpd_model.device, verbose=False)[0].boxes.xyxy
-                                    # ... assign plate candidates to online vehicles, ...
+                                    # ... map plate quadrilaterals to rectangles, ...
                                     online_rois = list(online.keys())
                                     online_boxes = torch.as_tensor(online_rois, device=device)
+                                    plate_roi_batch: List[ROI] = list()
+                                    overlap_idxs_batch: List[Tensor] = list()
+                                    warped_plate_bgr_batch: List[NDArray] = list()
+                                    warped_chars_bin_batch: List[NDArray] = list()
                                     for plate_box in plate_boxes:
                                         overlap_idxs = torch.nonzero(torch.logical_and(
                                             torch.logical_and(online_boxes[:, 2] >= plate_box[0], online_boxes[:, 0] <= plate_box[2]),
@@ -492,26 +482,30 @@ class Agent:
                                         if len(overlap_idxs) != 0:
                                             x1, y1, x2, y2 = map(lambda arg: arg.item(), plate_box.round().to(torch.int32).cpu())
                                             plate_roi = (min(max(x1, 0), frame_size[0] - 1), min(max(y1, 0), frame_size[1] - 1), min(max(x2, 0), frame_size[0] - 1), min(max(y2, 0), frame_size[1] - 1))
-                                            plate_candidates = self._read_plate(frame_bgr, plate_roi, ocr_model)
-                                            if len(plate_candidates) > 0:
+                                            self._warp_plate(frame_bgr, plate_roi, overlap_idxs, plate_roi_batch, overlap_idxs_batch, warped_plate_bgr_batch, warped_chars_bin_batch)
+                                    # ... perform OCR and assign plate candidates to online vehicles
+                                    if len(warped_chars_bin_batch) > 0:
+                                        ocr_batch = ocr_model.readtext_batched(warped_chars_bin_batch, batch_size=len(warped_chars_bin_batch), detail=0, allowlist=CHAR_WHITELIST)
+                                        for plate_roi, overlap_idxs, warped_plate_bgr, ocr in zip(plate_roi_batch, overlap_idxs_batch, warped_plate_bgr_batch, ocr_batch):
+                                            plate = ''.join(ocr)
+                                            if len(plate) >= 5:
                                                 for overlap_idx in overlap_idxs:
                                                     vehicle_roi = online_rois[overlap_idx]
                                                     vehicle = online[vehicle_roi]
                                                     plate_history = vehicle['plate_history']
-                                                    for plate_candidate in plate_candidates:
-                                                        detected_plate = DetectedPlate(
-                                                            plate=plate_candidate['plate'],
-                                                            plate_roi=plate_roi,
-                                                            vehicle_id=vehicle['id'],
-                                                            vehicle_roi=vehicle_roi,
-                                                            warped_plate=plate_candidate['warped_plate'],
-                                                            frame=frame_bgr,
-                                                            when=now,
-                                                        )
-                                                        plate_history.append(detected_plate)
-                                                        detected_plates.append(detected_plate)
+                                                    detected_plate = DetectedPlate(
+                                                        plate=plate,
+                                                        plate_roi=plate_roi,
+                                                        vehicle_id=vehicle['id'],
+                                                        vehicle_roi=vehicle_roi,
+                                                        warped_plate=warped_plate_bgr,
+                                                        frame=frame_bgr,
+                                                        when=now,
+                                                    )
+                                                    plate_history.append(detected_plate)
+                                                    detected_plates.append(detected_plate)
                                                     # In the meanwhile, report a new vehicle
-                                                    if len(plate_history) == len(plate_candidates):
+                                                    if len(plate_history) == 1:
                                                         storage_queue.put((StorageTask.CREATE, self._make_reported_plate(vehicle)))
                                 # ... update missing vehicles, ...
                                 for vehicle in deleted:
