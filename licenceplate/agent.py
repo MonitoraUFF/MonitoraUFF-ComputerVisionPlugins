@@ -13,7 +13,7 @@ from glob import glob
 from numpy.typing import NDArray
 from queue import Queue
 from tqdm import tqdm
-from typing import Any, Dict, Final, List, Optional, Sequence, Set, Tuple, TypedDict
+from typing import Any, Dict, Final, List, Optional, Sequence, Tuple, TypedDict
 from ultralytics import YOLO
 from ultralytics.engine.results import Boxes
 from zipfile import ZipFile
@@ -66,26 +66,23 @@ ROI = Tuple[int, int, int, int]  # (x1, y1, x2, y2)
 
 class DetectedPlate(TypedDict):
     plate: str
-    warped_plate: NDArray[np.uint8]
-    warped_plate_ocr: NDArray[np.uint8]
-    vehicle: NDArray[np.uint8]
-    vehicle_roi: ROI
     plate_roi: ROI
-    when: datetime
-
-
-class DetectedVehicle(TypedDict):
-    vehicle: NDArray[np.uint8]
+    vehicle_id: int
     vehicle_roi: ROI
+    warped_plate: NDArray[np.uint8]
+    frame: NDArray[np.uint8]
     when: datetime
+
+
+class PlateCandidate(TypedDict):
+    pass
 
 
 class ReportedPlate(TypedDict):
-    id: str
     plate: str
+    vehicle_name: str
     vehicle: NDArray[np.uint8]
     warped_plate: NDArray[np.uint8]
-    warped_plate_ocr: NDArray[np.uint8]
     when: datetime
 
 
@@ -101,9 +98,10 @@ class StoredPlate(TypedDict):
 
 
 class TrackedVehicle(TypedDict):
-    id: str
+    id: int
+    name: str
     last_seen: datetime
-    centroid_history: List[Tuple[int, int]]
+    centroid_history: List[Tuple[int, int]]  # Debug information
     plate_history: List[DetectedPlate]
 
 
@@ -112,7 +110,7 @@ class Agent:
     def __init__(self, tag_slug: str) -> None:
         # Set the logging system
         logging.config.fileConfig(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', 'logging.conf'))
-        self._logger = logging.getLogger('agent')
+        self._logger = logging.getLogger('licenceplate')
         # Initialize basic attributes
         self.tag_slug: Final = tag_slug
         self._keep_running = False
@@ -130,25 +128,29 @@ class Agent:
         # Log agent finalization
         self._logger.info(f'{self.tag_slug}\tdel')
 
-    def _draw_debug_info(self, frame_bgr: NDArray[np.uint8], vehicles: List[DetectedVehicle], plates: List[DetectedPlate], tracked_vehicles: Dict[int, TrackedVehicle]) -> NDArray[np.uint8]:
+    def _draw_debug_info(self, frame_bgr: NDArray[np.uint8], vehicles: Dict[int, TrackedVehicle], plates: List[DetectedPlate]) -> NDArray[np.uint8]:
+        counters: Dict[int, int] = dict()
+        width, height = TARGET_WIDTH // 2, TARGET_HEIGHT // 2
         # Make a copy of the current frame
         result_bgr = frame_bgr.copy()
         # Draw tracking
-        for id, tracked_vehicles in tracked_vehicles.items():
-            cv2.polylines(result_bgr, [np.stack(tracked_vehicles['centroid_history'])[:, None, :]], False, DRAW_BGR_COLOR_PALETTE[id % len(DRAW_BGR_COLOR_PALETTE)], DRAW_TRACKING_THICKNESS, cv2.LINE_8)
-        # Draw boxes for all cars
-        for vehicle in vehicles:
-            x1, y1, x2, y2 = vehicle['vehicle_roi']
-            cv2.rectangle(result_bgr, (x1, y1), (x2, y2), DRAW_BGR_WHITE, DRAW_BOX_THICKNESS)
-        # Draw a different box for cars whose a plate was detected
+        for id, vehicle in vehicles.items():
+            box_color = DRAW_BGR_COLOR_PALETTE[id % len(DRAW_BGR_COLOR_PALETTE)]
+            cv2.polylines(result_bgr, [np.stack(vehicle['centroid_history'])[:, None, :]], False, box_color, DRAW_TRACKING_THICKNESS, cv2.LINE_8)
+            counters[id] = 0
+        # Draw box for cars whose a plate was detected
         for plate in plates:
+            id = plate['vehicle_id']
+            box_color = DRAW_BGR_COLOR_PALETTE[id % len(DRAW_BGR_COLOR_PALETTE)]
+            x1, y1, x2, y2 = plate['plate_roi']
+            cv2.rectangle(result_bgr, (x1, y1), (x2, y2), box_color, DRAW_BOX_THICKNESS)
             x1, y1, x2, y2 = plate['vehicle_roi']
-            u1, v1, u2, v2 = plate['plate_roi']
-            width, height = TARGET_WIDTH // 2, TARGET_HEIGHT // 2
-            result_bgr[y1:y1+height, x1:x1+width] = cv2.resize(plate['warped_plate'], (width, height))
-            cv2.rectangle(result_bgr, (x1, y1), (x2, y2), DRAW_BGR_PASTEL_PINK, DRAW_BOX_THICKNESS)
-            cv2.rectangle(result_bgr, (x1, y1), (x1+width, y1+height), DRAW_BGR_PASTEL_PINK, DRAW_BOX_THICKNESS)
-            cv2.rectangle(result_bgr, (x1 + u1, y1 + v1), (x1 + u2, y1 + v2), DRAW_BGR_PASTEL_GREEN, DRAW_BOX_THICKNESS)
+            cv2.rectangle(result_bgr, (x1, y1), (x2, y2), box_color, DRAW_BOX_THICKNESS)
+            count = counters[id]
+            offset = count * height
+            result_bgr[offset+y1:offset+y1+height, x1:x1+width] = cv2.resize(plate['warped_plate'], (width, height))
+            cv2.rectangle(result_bgr, (x1, offset+y1), (x1+width, offset+y1+height), box_color, DRAW_BOX_THICKNESS)
+            counters[id] += 1
         # Return the resulting frame
         return result_bgr
 
@@ -208,53 +210,8 @@ class Agent:
         # Apply the affine transformation to input images
         return (cv2.warpAffine(image, affine_mtx, (TARGET_WIDTH, TARGET_HEIGHT)) for image in images)
 
-    def _detect_plate(self, vehicle: DetectedVehicle, *, lpd_model: YOLO, ocr_model: Reader) -> List[DetectedPlate]:
-        #TODO Fazer OCR em batch
-        result: List[DetectedPlate] = list()
-        # The vehicle's image may include several plate box candidates
-        vehicle_bgr = vehicle['vehicle']
-        for plate_box in lpd_model(vehicle_bgr, device=lpd_model.device, verbose=False)[0].boxes:
-            # The plate box includes a perspective projection of the plate, so we have to find the quadrilateral resulting from this projection
-            u1, v1, u2, v2 = map(lambda arg: arg.item(), plate_box.xyxy.round().to(torch.int32)[0].cpu())
-            plate_bgr = vehicle_bgr[v1:v2, u1:u2]
-            plate_gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
-            plate_bin = cv2.adaptiveThreshold(plate_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-            plate_contours, _ = cv2.findContours(plate_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            plate_contours = sorted(plate_contours, key=cv2.contourArea, reverse=True)[:5]
-            # Each contour is a candidate projected plate
-            for plate_contour in plate_contours:
-                # But the contours may be defined by more than four vertices, so we have to simplify it
-                chull = cv2.convexHull(plate_contour, clockwise=False, returnPoints=True)
-                while len(chull) > 4:
-                    vertices = np.concatenate((np.concatenate((chull[-1][None, ...], chull, chull[0][None, ...]), axis=0).squeeze(), np.ones((len(chull) + 2, 1), dtype=chull.dtype)), axis=1)
-                    matrices = np.stack((vertices[:-2], vertices[1:-1], vertices[2:]), axis=1, dtype=np.float32)
-                    min_idx = np.argmin(np.abs(np.linalg.det(matrices)))
-                    chull = np.delete(chull, min_idx, axis=0)
-                # Given a convex quadrilateral...
-                if len(chull) == 4:
-                    # ... warp it to the rectangular shape of the licence plate, ...
-                    warped_plate_bgr, warped_plate_gray = self._warp_to_target_rectangle(chull.squeeze(), (plate_bgr, plate_gray))
-                    # ... convert the warped gray image of the plate to a binary image, ...
-                    warped_plate_bin = self._convert_from_gray_to_binary(warped_plate_gray)
-                    # ... compute an binary image having only the characters of the plate, ...
-                    warped_chars_bin = self._compute_binary_image_of_chars(warped_plate_bin)
-                    # ... and perform OCR
-                    plate = ''.join(ocr_model.readtext(warped_chars_bin, detail=0, allowlist=CHAR_WHITELIST))
-                    if len(plate) >= 5:
-                        result.append(DetectedPlate(
-                            plate=plate,
-                            warped_plate=warped_plate_bgr,
-                            warped_plate_ocr=warped_chars_bin,
-                            vehicle=vehicle_bgr,
-                            vehicle_roi=vehicle['vehicle_roi'],
-                            plate_roi=(u1, v1, u2, v2),
-                            when=vehicle['when'],
-                            tracked_vehicle=vehicle['tracked_vehicle'],
-                        ))
-        return result
-    
-    def _make_reported_plate(self, tracked_vehicle: TrackedVehicle) -> ReportedPlate:
-        history = tracked_vehicle['plate_history']
+    def _make_reported_plate(self, vehicle: TrackedVehicle) -> ReportedPlate:
+        history = vehicle['plate_history']
         if len(history) == 1:
             # Peek the single plate we have
             best_detected_plate = history[0]
@@ -280,19 +237,18 @@ class Agent:
                     best_ratio = ratio
                     best_detected_plate = detected_plate
         # Return the plate to be reported
+        x1, y1, x2, y2 = best_detected_plate['vehicle_roi']
         return ReportedPlate(
-            id=tracked_vehicle['id'],
             plate=plate,
-            vehicle=best_detected_plate['vehicle'],
+            vehicle_name=vehicle['name'],
+            vehicle=best_detected_plate['frame'][y1:y2, x1:x2],
             warped_plate=best_detected_plate['warped_plate'],
-            warped_plate_ocr=best_detected_plate['warped_plate_ocr'],
             when=best_detected_plate['when'],
         )
 
-    def _perform_tracking(self, boxes: Boxes, now: datetime, frame_size: Tuple[int, int], tracker_model: BYTETracker, tracked_vehicles: Dict[int, TrackedVehicle], patience_in_seconds: float, include_debug_info: bool) -> Tuple[Dict[ROI, TrackedVehicle], Set[ROI], List[TrackedVehicle]]:
+    def _perform_tracking(self, boxes: Boxes, vehicles: Dict[int, TrackedVehicle], now: datetime, tracker_model: BYTETracker, frame_size: Tuple[int, int], patience_in_seconds: float, include_debug_info: bool) -> Tuple[Dict[ROI, TrackedVehicle], List[TrackedVehicle]]:
         # Create resulting lists
         online: Dict[ROI, TrackedVehicle] = dict()
-        created: Set[TrackedVehicle] = set()
         deleted: List[TrackedVehicle] = list()
         # Update the tracker with the detected boxes
         online_vehicles = tracker_model.update(boxes.data.cpu(), None)
@@ -301,33 +257,74 @@ class Agent:
             vehicle_roi = (min(max(x1, 0), frame_size[0] - 1), min(max(y1, 0), frame_size[1] - 1), min(max(x2, 0), frame_size[0] - 1), min(max(y2, 0), frame_size[1] - 1))
             if (vehicle_roi[2] - vehicle_roi[0]) > 0 and (vehicle_roi[3] - vehicle_roi[1]) > 0:
                 centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
-                tracked_vehicle = tracked_vehicles.get(id, None)
+                vehicle = vehicles.get(id, None)
                 # Check whether the current tracked vehicle is new and report this vehicle as "created"
-                if tracked_vehicle is None:
-                    tracked_vehicle = TrackedVehicle(
+                if vehicle is None:
+                    vehicle = TrackedVehicle(
                         id=id,
+                        name=str(uuid.uuid4()),
                         last_seen=now,
                         **(dict(centroid_history=[centroid]) if include_debug_info else dict()),
                         plate_history=[],
                     )
-                    created.add(vehicle_roi)
-                    tracked_vehicles[id] = tracked_vehicle
+                    vehicles[id] = vehicle
                 # Otherwise, update its information
                 else:
-                    tracked_vehicle['last_seen'] = now
+                    vehicle['last_seen'] = now
                     if include_debug_info:
-                        tracked_vehicle['centroid_history'].append(centroid)
-                online[vehicle_roi] = tracked_vehicle
+                        vehicle['centroid_history'].append(centroid)
+                online[vehicle_roi] = vehicle
         # Remove vehicles that have not been seen for a long time
-        for id, tracked_vehicle in tracked_vehicles.items():
-            elapsed_time = (now - tracked_vehicle['last_seen']).total_seconds()
+        for id, vehicle in vehicles.items():
+            elapsed_time = (now - vehicle['last_seen']).total_seconds()
             if elapsed_time > patience_in_seconds:
-                deleted.append(tracked_vehicle)
-        for tracked_vehicle in deleted:
-            del tracked_vehicles[tracked_vehicle['id']]
-        # Return the list of current vehicles, new vehicles, and vehicles that are missing for a long time
-        return online, created, deleted
+                deleted.append(vehicle)
+        for vehicle in deleted:
+            del vehicles[vehicle['id']]
+        # Return the list of current vehicles and vehicles that are missing for a long time
+        return online, deleted
     
+    def _read_plate(self, frame_bgr: NDArray[np.uint8], plate_roi: ROI, ocr_model: Reader) -> List[PlateCandidate]:
+        result: List[PlateCandidate] = list()
+        # The plate ROI includes a perspective projection of the plate, so we have to find the quadrilateral resulting from this projection
+        plate_bgr = frame_bgr[plate_roi[1]:plate_roi[3], plate_roi[0]:plate_roi[2]]
+        plate_gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+        plate_bin = cv2.adaptiveThreshold(plate_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        plate_contours, _ = cv2.findContours(plate_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        plate_contours = sorted(plate_contours, key=cv2.contourArea, reverse=True)[:5]
+        # Each contour is a candidate projected plate
+        warped_plate_bgr_list: List[NDArray] = list()
+        warped_chars_bin_list: List[NDArray] = list()
+        for plate_contour in plate_contours:
+            # But the contours may be defined by more than four vertices, so we have to simplify it
+            chull = cv2.convexHull(plate_contour, clockwise=False, returnPoints=True)
+            while len(chull) > 4:
+                vertices = np.concatenate((np.concatenate((chull[-1][None, ...], chull, chull[0][None, ...]), axis=0).squeeze(), np.ones((len(chull) + 2, 1), dtype=chull.dtype)), axis=1)
+                matrices = np.stack((vertices[:-2], vertices[1:-1], vertices[2:]), axis=1, dtype=np.float32)
+                min_idx = np.argmin(np.abs(np.linalg.det(matrices)))
+                chull = np.delete(chull, min_idx, axis=0)
+            # Given a convex quadrilateral...
+            if len(chull) == 4:
+                # ... warp it to the rectangular shape of the licence plate, ...
+                warped_plate_bgr, warped_plate_gray = self._warp_to_target_rectangle(chull.squeeze(), (plate_bgr, plate_gray))
+                # ... convert the warped gray image of the plate to a binary image, ...
+                warped_plate_bin = self._convert_from_gray_to_binary(warped_plate_gray)
+                # ... compute an binary image having only the characters of the plate, ...
+                warped_chars_bin = self._compute_binary_image_of_chars(warped_plate_bin)
+                # ... and keep images
+                warped_plate_bgr_list.append(warped_plate_bgr)
+                warped_chars_bin_list.append(warped_chars_bin)
+        # Perform OCR
+        #TODO Fazer batches maiores
+        for warped_plate_bgr, ocr in zip(warped_plate_bgr_list, ocr_model.readtext_batched(warped_chars_bin_list, batch_size=len(warped_chars_bin_list), detail=0, allowlist=CHAR_WHITELIST)):
+            plate = ''.join(ocr)
+            if len(plate) >= 5:
+                result.append(PlateCandidate(
+                    plate=plate,
+                    warped_plate=warped_plate_bgr,
+                ))
+        return result
+
     def _run_final_storage_worker(self, server_address: str) -> None:
         self._logger.debug(f'{self.tag_slug}\tfinal storage worker - begin')
         try:
@@ -385,11 +382,9 @@ class Agent:
                     if not success: raise Exception('Error converting to PNG')
                     success, warped_plate_png = cv2.imencode('.png', reported_plate['warped_plate'])
                     if not success: raise Exception('Error converting to PNG')
-                    success, warped_plate_ocr_png = cv2.imencode('.png', reported_plate['warped_plate_ocr'])
-                    if not success: raise Exception('Error converting to PNG')
                     with self._local_storage_lock:
                         # Put all information in a ZIP file
-                        filename = f'{reported_plate["id"]}.zip'
+                        filename = f'{reported_plate["vehicle_name"]}.zip'
                         password = ''.join(random.choice(PASSWORD_CHARS) for _ in range(PASSWORD_SIZE))
                         info = StoredPlate(
                             plate=reported_plate['plate'],
@@ -399,7 +394,6 @@ class Agent:
                             zf.writestr('info.json', json.dumps(info))
                             zf.writestr('vehicle.png', vehicle_png.tostring())
                             zf.writestr('warped_plate.png', warped_plate_png.tostring())
-                            zf.writestr('warped_plate_ocr.png', warped_plate_ocr_png.tostring())
                         with open(os.path.join(self._local_storage_dir, filename), mode='rb') as fp:
                             md5sum = hashlib.md5()
                             for buf in iter(partial(fp.read, 128), b''):
@@ -427,27 +421,7 @@ class Agent:
             raise            
         self._logger.debug(f'{self.tag_slug}\tlocal storage worker #{worker_idx} - end')
 
-    def _run_vehicle_worker(self, worker_idx: int, lpd_model: YOLO, ocr_model: Reader, vehicle_queue: "Queue[DetectedVehicle]", detected_plates: List[DetectedPlate]) -> None:
-        # Get first vehicle
-        detected_vehicle = vehicle_queue.get()
-        try:
-            # If there is a vehicle to be processed then...
-            while detected_vehicle is not None:
-                vehicle_queue.task_done()
-                # .... find each plate candidate in the vehicle's image...
-                plate_candidates = self._detect_plate(detected_vehicle, lpd_model=lpd_model, ocr_model=ocr_model)
-                # ... and update the list of detected plates if needed
-                if len(plate_candidates) != 0:
-                    plate_candidates.sort(key=lambda arg: len(arg['plate']))
-                    detected_plates.append(plate_candidates[-1])
-                # Get the next vehicle
-                detected_vehicle = vehicle_queue.get()
-        except Exception as error:
-            self._logger.exception(f'{self.tag_slug}\vehicle processing worker #{worker_idx} - end by exception: "{str(error)}"')
-        finally:
-            vehicle_queue.task_done()
-        
-    def _run_video_loop(self, server_address: str, video_uri: str, output_filename: Optional[str], output_fourcc: Optional[str], tracking_patience_in_seconds: float, num_vehicle_workers: int, num_local_storage_workers: int, vehicle_queue_size: int, storage_queue_size: int) -> None:
+    def _run_video_loop(self, server_address: str, video_uri: str, output_filename: Optional[str], output_fourcc: Optional[str], tracking_patience_in_seconds: float, num_local_storage_workers: int, storage_queue_size: int) -> None:
         draw_debug_info = output_filename is not None
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config')
@@ -465,17 +439,19 @@ class Agent:
                 video.release()
             # Create a YOLO model pre-trained on the COCO dataset and find the ID of the vehicle classes
             coco_model = YOLO(os.path.join(config_dir, 'yolov8n.pt')).to(device)
+            coco_model_imgsz = (640, int(640 * (frame_size[0] / frame_size[1]))) if frame_size[0] > frame_size[1] else (int(640 * (frame_size[1] / frame_size[0])), 640)
             coco_ids = list(coco_model.names.keys())
             coco_names = list(coco_model.names.values())
             used_coco_ids = [coco_ids[coco_names.index(name)] for name in USED_COCO_CLASS_NAMES]
+            # Create a YOLO models pre-trained on a LPR dataset (https://universe.roboflow.com/roboflow-universe-projects/license-plate-recognition-rxg4e/dataset/4)
+            lpd_model = YOLO(os.path.join(config_dir, 'yolov8lpd.pt')).to(device)
+            lpd_model_imgsz = (640, int(640 * (frame_size[0] / frame_size[1]))) if frame_size[0] > frame_size[1] else (int(640 * (frame_size[1] / frame_size[0])), 640)
+            # Create an EasyOCR model
+            ocr_model = Reader(['en'], gpu=torch.cuda.is_available())
             # Create a tracker model
             tracker_model = BYTETracker(track_thresh=0.0, track_buffer=int(tracking_patience_in_seconds * frame_rate + 0.5), match_thresh=0.95, frame_rate=int(frame_rate))  # track_thresh=0.0 means we want to keep all boxes
-            tracked_vehicles: Dict[int, TrackedVehicle] = dict()
-            # Create a set of YOLO models pre-trained on a LPR dataset (https://universe.roboflow.com/roboflow-universe-projects/license-plate-recognition-rxg4e/dataset/4) and a set of EasyOCR models
-            lpd_models = [YOLO(os.path.join(config_dir, 'yolov8lpd.pt')).to(device) for _ in range(num_vehicle_workers)]
-            ocr_models = [Reader(['en'], gpu=torch.cuda.is_available()) for _ in range(num_vehicle_workers)]
-            # Create the queues that keep the data to be processed and stored locally
-            vehicle_queue: "Queue[DetectedVehicle]" = Queue(maxsize=vehicle_queue_size)
+            vehicles: Dict[int, TrackedVehicle] = dict()
+            # Create the queue that keep the data to be stored locally
             storage_queue: "Queue[Tuple[StorageTask, ReportedPlate]]" = Queue(maxsize=storage_queue_size)
             # Create and start local storage workers
             local_storage_workers = [threading.Thread(target=self._run_local_storage_worker, args=(worker_idx, storage_queue,), daemon=True) for worker_idx in range(num_local_storage_workers)]
@@ -489,49 +465,62 @@ class Agent:
                     # Open the video stream
                     self._status |= AgentStatus.PROCESSING 
                     self._send(server_address, AgentEvent.STREAM_OPEN, None)
-                    self._logger.info(f'{self.tag_slug}\tstream opened')
+                    self._logger.info(f'{self.tag_slug}\tstream "{video_uri}" opened')
                     try:
                         video_writer = VideoWriter(output_filename, fourcc, frame_rate, frame_size) if draw_debug_info else None
                         try:
-                            # For each frame...
-                            for vehicles in tqdm(coco_model(video_uri, classes=used_coco_ids, device=coco_model.device, stream=True, stream_buffer=draw_debug_info, verbose=False), desc=f'Processing "{video_uri}"', total=frame_count, disable=(not os.path.isfile(video_uri))):
+                            # For each frame, detect the vehicles...
+                            for detected_vehicles in tqdm(coco_model(video_uri, imgsz=coco_model_imgsz, classes=used_coco_ids, device=coco_model.device, stream=True, stream_buffer=draw_debug_info, verbose=False), desc=f'Processing "{video_uri}"', total=frame_count, disable=(not os.path.isfile(video_uri))):
                                 if not self._keep_running:
                                     break
                                 now = datetime.now()
-                                frame_bgr = vehicles.orig_img
+                                frame_bgr: NDArray[np.uint8] = detected_vehicles.orig_img
                                 # ... update the tracking system, ...
-                                online, created, deleted = self._perform_tracking(vehicles.boxes, now, frame_size, tracker_model, tracked_vehicles, tracking_patience_in_seconds, draw_debug_info)
-                                # ... get each detected vehicle and enqueue them for processing, ...
-                                detected_vehicles: List[DetectedVehicle] = list()
-                                for vehicle_roi, tracked_vehicle in online.items():
-                                    detected_vehicle = DetectedVehicle(
-                                        tracked_vehicle=tracked_vehicle,
-                                        vehicle=frame_bgr[vehicle_roi[1]:vehicle_roi[3], vehicle_roi[0]:vehicle_roi[2]],
-                                        vehicle_roi=vehicle_roi,
-                                        when=now,
-                                    )
-                                    detected_vehicles.append(detected_vehicle)
-                                    vehicle_queue.put(detected_vehicle)
-                                for _ in range(num_vehicle_workers): vehicle_queue.put(None)  # Enqueue empty data to sinalize the end of processing
-                                # ... create and start vehicle processing workers using YOLO models pre-trained on a LPR dataset (https://universe.roboflow.com/roboflow-universe-projects/license-plate-recognition-rxg4e/dataset/4), ...
+                                online, deleted = self._perform_tracking(detected_vehicles.boxes, vehicles, now, tracker_model, frame_size, tracking_patience_in_seconds, draw_debug_info)
+                                # ... detect the licence plates, ...
                                 detected_plates: List[DetectedPlate] = list()
-                                vehicle_workers = [threading.Thread(target=self._run_vehicle_worker, args=(worker_idx, lpd_models[worker_idx], ocr_models[worker_idx], vehicle_queue, detected_plates,), daemon=True) for worker_idx in range(num_vehicle_workers)]
-                                for worker in vehicle_workers: worker.start()
-                                vehicle_queue.join()
-                                # ... assign detected licence plates to tracked vehicles, ...
-                                for detected_plate in detected_plates:
-                                    vehicle_roi = detected_plate['vehicle_roi']
-                                    tracked_vehicle = detected_plate['tracked_vehicle']
-                                    tracked_vehicle['plate_history'].append(detected_plate)
-                                    if vehicle_roi in created:
-                                        storage_queue.put((StorageTask.CREATE, self._make_reported_plate(tracked_vehicle)))
-                                for tracked_vehicle in deleted:
-                                    if len(tracked_vehicle['plate_history']) != 0:
-                                        storage_queue.put((StorageTask.UPDATE, self._make_reported_plate(tracked_vehicle)))
+                                if len(online) != 0:
+                                    plate_boxes = lpd_model(frame_bgr, imgsz=lpd_model_imgsz, device=lpd_model.device, verbose=False)[0].boxes.xyxy
+                                    # ... assign plate candidates to online vehicles, ...
+                                    online_rois = list(online.keys())
+                                    online_boxes = torch.as_tensor(online_rois, device=device)
+                                    for plate_box in plate_boxes:
+                                        overlap_idxs = torch.nonzero(torch.logical_and(
+                                            torch.logical_and(online_boxes[:, 2] >= plate_box[0], online_boxes[:, 0] <= plate_box[2]),
+                                            torch.logical_and(online_boxes[:, 3] >= plate_box[1], online_boxes[:, 1] <= plate_box[3])
+                                        ))
+                                        if len(overlap_idxs) != 0:
+                                            x1, y1, x2, y2 = map(lambda arg: arg.item(), plate_box.round().to(torch.int32).cpu())
+                                            plate_roi = (min(max(x1, 0), frame_size[0] - 1), min(max(y1, 0), frame_size[1] - 1), min(max(x2, 0), frame_size[0] - 1), min(max(y2, 0), frame_size[1] - 1))
+                                            plate_candidates = self._read_plate(frame_bgr, plate_roi, ocr_model)
+                                            if len(plate_candidates) > 0:
+                                                for overlap_idx in overlap_idxs:
+                                                    vehicle_roi = online_rois[overlap_idx]
+                                                    vehicle = online[vehicle_roi]
+                                                    plate_history = vehicle['plate_history']
+                                                    for plate_candidate in plate_candidates:
+                                                        detected_plate = DetectedPlate(
+                                                            plate=plate_candidate['plate'],
+                                                            plate_roi=plate_roi,
+                                                            vehicle_id=vehicle['id'],
+                                                            vehicle_roi=vehicle_roi,
+                                                            warped_plate=plate_candidate['warped_plate'],
+                                                            frame=frame_bgr,
+                                                            when=now,
+                                                        )
+                                                        plate_history.append(detected_plate)
+                                                        detected_plates.append(detected_plate)
+                                                    # In the meanwhile, report a new vehicle
+                                                    if len(plate_history) == len(plate_candidates):
+                                                        storage_queue.put((StorageTask.CREATE, self._make_reported_plate(vehicle)))
+                                # ... update missing vehicles, ...
+                                for vehicle in deleted:
+                                    if len(vehicle['plate_history']) != 0:
+                                        storage_queue.put((StorageTask.UPDATE, self._make_reported_plate(vehicle)))
                                 # ... and draw results if needed
                                 if video_writer is not None:
-                                    video_writer.write(self._draw_debug_info(frame_bgr, detected_vehicles, detected_plates, tracked_vehicles))
-                            self._logger.info(f'{self.tag_slug}\tstream closed')
+                                    video_writer.write(self._draw_debug_info(frame_bgr, vehicles, detected_plates))
+                            self._logger.info(f'{self.tag_slug}\tstream "{video_uri}" closed')
                             if video_writer is not None:
                                 self._keep_running = False
                         finally:
@@ -541,7 +530,7 @@ class Agent:
                         self._send(server_address, AgentEvent.STREAM_CLOSE, None)
                         self._status ^= AgentStatus.PROCESSING
                 except Exception as error:
-                    self._logger.error(f'{self.tag_slug}\tstream closed by exception, loop still running: "{str(error)}"')
+                    self._logger.error(f'{self.tag_slug}\tstream "{video_uri}" closed by exception, loop still running: "{str(error)}"')
                     time.sleep(10)
             for _ in range(num_local_storage_workers): storage_queue.put(None)
             storage_queue.join()
@@ -562,15 +551,15 @@ class Agent:
             raise
         self._logger.debug(f'{self.tag_slug}\tsend - end')
 
-    def run(self, server_address: str, video_uri: str, output_filename: Optional[str] = default.OUTPUT_FILENAME, output_fourcc: Optional[str] = default.OUTPUT_FOURCC, tracking_patience_in_seconds: float = default.TRACKING_PATIENCE_IN_SECONDS, num_vehicle_workers: int = default.NUM_VEHICLE_WORKERS, num_local_storage_workers: int = default.NUM_LOCAL_STORAGE_WORKERS, vehicle_queue_size: int = default.VEHICLE_QUEUE_SIZE, storage_queue_size: int = default.STORAGE_QUEUE_SIZE) -> None:
-        self._logger.info(f'{self.tag_slug}\trun - begin [video_uri="{video_uri}", num_vehicle_workers={num_vehicle_workers}, num_local_storage_workers={num_local_storage_workers}, vehicle_queue_size={vehicle_queue_size}, storage_queue_size={storage_queue_size}]')
+    def run(self, server_address: str, video_uri: str, output_filename: Optional[str] = default.OUTPUT_FILENAME, output_fourcc: Optional[str] = default.OUTPUT_FOURCC, tracking_patience_in_seconds: float = default.TRACKING_PATIENCE_IN_SECONDS, num_local_storage_workers: int = default.NUM_LOCAL_STORAGE_WORKERS, storage_queue_size: int = default.STORAGE_QUEUE_SIZE) -> None:
+        self._logger.info(f'{self.tag_slug}\trun - begin [video_uri="{video_uri}", tracking_patience_in_seconds={tracking_patience_in_seconds}, num_local_storage_workers={num_local_storage_workers}, storage_queue_size={storage_queue_size}]')
         try:
             # Check if the agent is already running
             if AgentStatus.RUNNING in self.status: raise Exception('The agent is running already')
             self._keep_running = True
             try:
                 # Start the main thread of the agent
-                thread = threading.Thread(target=self._run_video_loop, args=(server_address, video_uri, output_filename, output_fourcc, tracking_patience_in_seconds, num_vehicle_workers, num_local_storage_workers, vehicle_queue_size, storage_queue_size,), daemon=True)
+                thread = threading.Thread(target=self._run_video_loop, args=(server_address, video_uri, output_filename, output_fourcc, tracking_patience_in_seconds, num_local_storage_workers, storage_queue_size,), daemon=True)
                 thread.start()
                 thread.join()
             finally:
